@@ -1,0 +1,164 @@
+from datasets import Dataset
+import pandas as pd
+import torch
+from transformers import TrainingArguments, DataCollatorForSeq2Seq
+from trl.trainer.sft_trainer import SFTTrainer
+from unsloth.chat_templates import standardize_sharegpt, get_chat_template
+from unsloth import FastLanguageModel
+import os
+os.environ["WANDB_MODE"] = "disabled"
+# Add these environment variables to fix Triton issues
+os.environ["TRITON_DISABLE_LINE_INFO"] = "1"
+os.environ["TRITON_ENABLE_LLVM_DEBUG"] = "0"
+
+
+# Model and tokenizer setup
+max_seq_length = 2048
+dtype = torch.float16  # Explicitly set dtype
+load_in_4bit = True
+model_path = "/raid/deeksha/graph_coarsening/models/meta-llama/Llama-3.1-8B-Instruct"
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=model_path,
+    max_seq_length=max_seq_length,
+    dtype=dtype,
+    load_in_4bit=load_in_4bit,
+    token="",
+    # Add these parameters to avoid Triton issues
+    attn_implementation="eager",  # Use eager attention instead of flash attention
+    device_map="",
+)
+
+train_df = pd.read_csv('data/train.csv')
+val_df = pd.read_csv('data/test.csv')
+
+
+def format_conversation(row):
+    return {
+        "conversations": [
+            {"role": "user", "content": str(row["question"])},
+            {"role": "assistant", "content": str(row["answer"])}
+        ]
+    }
+
+
+def create_dataset(df):
+    return Dataset.from_pandas(pd.DataFrame([format_conversation(row) for _, row in df.iterrows()]))
+
+
+train_dataset = create_dataset(train_df)
+val_dataset = create_dataset(val_df)
+train_dataset = standardize_sharegpt(train_dataset)
+val_dataset = standardize_sharegpt(val_dataset)
+
+# Apply chat template
+tokenizer = get_chat_template(tokenizer, chat_template="llama-3.1")
+
+
+def formatting_prompts_func(examples):
+    convos = examples["conversations"]
+    # Generate text using the chat template
+    texts = [tokenizer.apply_chat_template(
+        convo, tokenize=False, add_generation_prompt=False) for convo in convos]
+    # Tokenize the texts
+    tokenized = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max_seq_length,
+        return_tensors="pt"
+    )
+    labels = tokenized["input_ids"].clone()
+    return {
+        "input_ids": tokenized["input_ids"],
+        "attention_mask": tokenized["attention_mask"],
+        "labels": labels
+    }
+
+
+train_dataset = train_dataset.map(formatting_prompts_func, batched=True)
+val_dataset = val_dataset.map(formatting_prompts_func, batched=True)
+
+# Verify dataset
+print(f"Training dataset size: {len(train_dataset)} examples")
+print("Sample from train_dataset:", train_dataset[0])
+
+# LoRA configuration with more conservative settings
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    target_modules=["q_proj", "k_proj", "v_proj",
+                    "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_alpha=16,
+    lora_dropout=0,
+    bias="none",
+    use_gradient_checkpointing="unsloth",
+    random_state=3407,
+    use_rslora=False,
+    loftq_config=None,
+)
+
+# Training setup with more conservative settings
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    dataset_text_field=None,
+    max_seq_length=max_seq_length,
+    data_collator=DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        label_pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100
+    ),
+    dataset_num_proc=2,
+    packing=False,
+    args=TrainingArguments(
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=4,
+        warmup_steps=5,
+        num_train_epochs=1,
+        learning_rate=2e-4,
+        save_steps=10,
+        save_strategy="steps",
+        fp16=True,  # Force fp16 instead of auto-detection
+        bf16=False,  # Disable bf16 explicitly
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=3407,
+        output_dir="/raid/deeksha/mimic/trained_models/multi_1st_run",
+        metric_for_best_model="eval_loss",
+        report_to=None,
+        logging_steps=10,
+        log_level="debug",
+        # Add these to potentially help with stability
+        dataloader_pin_memory=False,
+        dataloader_num_workers=0,  # Reduce to 0 to avoid multiprocessing issues
+    ),
+)
+
+# Memory stats
+gpu_stats = torch.cuda.get_device_properties(0)
+start_gpu_memory = round(
+    torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
+print(f"{start_gpu_memory} GB of memory reserved.")
+
+# Train
+trainer_stats = trainer.train()
+
+# Final memory and time stats
+used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
+used_percentage = round(used_memory / max_memory * 100, 3)
+lora_percentage = round(used_memory_for_lora / max_memory * 100, 3)
+print(f"{trainer_stats.metrics['train_runtime']} seconds used for training.")
+print(
+    f"{round(trainer_stats.metrics['train_runtime']/60, 2)} minutes used for training.")
+print(f"Peak reserved memory = {used_memory} GB.")
+print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
+print(f"Peak reserved memory % of max memory = {used_percentage} %.")
+print(
+    f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
